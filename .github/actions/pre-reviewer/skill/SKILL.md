@@ -43,7 +43,7 @@ the pull request changes.
 
 For changed XML lines, fetch and apply the XML-file guidelines at:
 
-`https://www.odoo.com/documentation/{version}/contributing/development/coding_guidelines.html#xml-files`
+`https://raw.githubusercontent.com/odoo/documentation/{version}/content/contributing/development/coding_guidelines.rst`
 
 Replace `{version}` with the canonical version determined above. Report only a
 concrete violation in a line added or modified by this pull request. Each
