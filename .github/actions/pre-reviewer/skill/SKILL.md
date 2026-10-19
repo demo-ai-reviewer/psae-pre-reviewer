@@ -43,9 +43,13 @@ the pull request changes.
 
 For changed XML lines, fetch and apply the XML-file guidelines at:
 
-`https://raw.githubusercontent.com/odoo/documentation/{version}/content/contributing/development/coding_guidelines.rst`
+`https://www.odoo.com/documentation/{version}/contributing/development/coding_guidelines.html#xml-files`
 
-Replace `{version}` with the canonical version determined above. Report only a
+Replace `{version}` with the canonical version determined above. Fetch only the
+"XML files" section of that page (its Format, XML IDs and naming, and
+Inheriting XML parts), not the whole page: ask WebFetch for that section
+verbatim, and when the page is cut off before it, fetch again from the offset
+WebFetch gives until you have the whole section. Report only a
 concrete violation in a line added or modified by this pull request. Each
 finding must identify the changed file and line and the specific guideline that
 is violated. Do not report stylistic preferences that are not stated in those
