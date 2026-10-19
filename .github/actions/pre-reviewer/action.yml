@@ -1,0 +1,59 @@
+name: PSAE pre-reviewer
+description: Run the centrally managed PSAE pre-review instructions with Claude Code, as the reviewer account.
+
+inputs:
+  claude_code_oauth_token:
+    description: Claude Code OAuth token used by the Claude Code action.
+    required: true
+  github_token:
+    description: Classic token of the reviewer account (e.g. odoobot-psae); comments and review requests are posted as that account.
+    required: true
+  pull_request:
+    description: URL of the pull request to review.
+    required: true
+
+outputs:
+  structured_output:
+    description: Structured pre-review result returned by Claude Code.
+    value: ${{ steps.pre_reviewer.outputs.structured_output }}
+
+runs:
+  using: composite
+  steps:
+    - name: Load central pre-review instructions
+      id: prompt
+      env:
+        PULL_REQUEST: ${{ inputs.pull_request }}
+      shell: bash
+      run: |
+        delimiter="PSAE_PRE_REVIEW_PROMPT_$(date +%s%N)"
+        {
+          echo "value<<$delimiter"
+          sed '1,/^---$/d' "$GITHUB_ACTION_PATH/skill/SKILL.md"
+          printf '\nPull request: %s\n' "$PULL_REQUEST"
+          cat <<'NOTE'
+
+          Tool use: Bash is available for exactly these commands, run one per
+          call in plain form, without pipes (`|`), `&&`, `;`, `cd` or
+          redirections: `git diff`, `git log`, `git show`, `gh pr view`,
+          `gh pr diff`, `gh api repos/...` (read-only GET). A command written
+          any other way is denied; when one is denied, run it again in plain
+          form instead of stopping. Use Read, Glob and Grep for files.
+        NOTE
+          echo "$delimiter"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Run Claude pre-reviewer
+      id: pre_reviewer
+      uses: anthropics/claude-code-action@v1
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_token }}
+        prompt: ${{ steps.prompt.outputs.value }}
+        claude_args: |
+          --model sonnet
+          --max-turns 40
+          --permission-mode dontAsk
+          --disallowedTools "Edit,Write"
+          --allowedTools "Read,Glob,Grep,WebFetch,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api repos/:*)"
+          --json-schema '{"type":"object","properties":{"status":{"type":"string","enum":["pass","fail"]},"target_version":{"type":"string"},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"inline_comments":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"start_line":{"type":"integer"},"body":{"type":"string"}},"required":["path","line","body"],"additionalProperties":false}},"reviewers_requested":{"type":"array","items":{"type":"string"}}},"required":["status","target_version","summary","findings","inline_comments","reviewers_requested"],"additionalProperties":false}'

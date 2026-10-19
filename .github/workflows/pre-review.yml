@@ -1,0 +1,154 @@
+name: PSAE pre-review
+
+# Called by each reviewed repository's small workflow when a pull request is
+# opened and on every push to it (force pushes included). Claude reviews it as
+# the reviewer account, comments the findings, and requests the PSAE review
+# team once it passes. The check fails until a push passes.
+
+on:
+  workflow_call:
+    secrets:
+      ODOOBOT_TOKEN:
+        description: Classic token of the reviewer account (repo and read:org scopes).
+        required: true
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  pre-review:
+    name: Agent Pre-review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out pull request merge commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ODOOBOT_TOKEN }}
+
+      - name: Run central pre-reviewer
+        id: pre_reviewer
+        uses: demo-ai-reviewer/psae-pre-reviewer/.github/actions/pre-reviewer@main
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.ODOOBOT_TOKEN }}
+          pull_request: ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+      - name: Enforce pre-review result
+        env:
+          PRE_REVIEW_RESULT: ${{ steps.pre_reviewer.outputs.structured_output }}
+          PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.ODOOBOT_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if [ -z "$PRE_REVIEW_RESULT" ]; then
+            echo "::error::Claude returned no structured pre-review result."
+            exit 1
+          fi
+          printf '%s\n' "$PRE_REVIEW_RESULT" | jq . || printf '%s\n' "$PRE_REVIEW_RESULT"
+
+          # Descriptions are verified here too, so a miss by the reviewer
+          # cannot let an undocumented pull request or commit through.
+          problems=()
+          body=$(gh pr view "$PR_URL" --json body --jq '.body // ""')
+          if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+            problems+=("The pull request has no description: explain what the change does and why.")
+          fi
+          while IFS=$'\t' read -r oid headline; do
+            message=$(gh api "repos/$GITHUB_REPOSITORY/commits/$oid" --jq '.commit.message')
+            described=$(printf '%s\n' "$message" | tail -n +2 | grep -vE '^[A-Za-z][A-Za-z-]*: ' | tr -d '[:space:]')
+            if [[ "$headline" != Merge* && -z "$described" ]]; then
+              problems+=("Commit \`${oid:0:7}\` (\`$headline\`) has no description: explain the change below the subject.")
+            fi
+          done < <(gh pr view "$PR_URL" --json commits --jq '.commits[] | [.oid, .messageHeadline] | @tsv')
+
+          status=$(printf '%s' "$PRE_REVIEW_RESULT" | jq -r '.status')
+          summary=$(printf '%s' "$PRE_REVIEW_RESULT" | jq -r '.summary')
+          mapfile -t findings < <(printf '%s' "$PRE_REVIEW_RESULT" | jq -r '.findings[]')
+          # Add a description problem only when the reviewer did not report it.
+          reported=$(printf '%s\n' "${findings[@]}" | tr '[:upper:]' '[:lower:]')
+          for problem in "${problems[@]}"; do
+            if [[ "$problem" == "The pull request"* ]]; then
+              grep -q 'pull request.*description\|description.*pull request' <<< "$reported" && continue
+            else
+              hash=$(sed -E 's/^Commit `([0-9a-f]{7}).*/\1/' <<< "$problem")
+              grep -q "$hash" <<< "$reported" && continue
+            fi
+            findings+=("$problem")
+          done
+
+          # The first run posts ONE review: the summary as its body and, with
+          # "yes", the reviewer's inline comments. Later runs edit that review's
+          # summary in place (no new message); only inline comments on issues
+          # not commented before go out as a new review, since GitHub cannot add
+          # comments to a submitted review.
+          marker='<!-- psae-pre-review -->'
+          post_review() {
+            local body comments extra me existing reviews="repos/$GITHUB_REPOSITORY/pulls/${PR_URL##*/}/reviews"
+            body="$marker"$'\n'"$(cat)"
+            comments='[]'
+            if [ "$1" = yes ]; then
+              comments=$(printf '%s' "$PRE_REVIEW_RESULT" | jq '[.inline_comments[] | {path, line, body, side: "RIGHT"}
+                + (if (.start_line // .line) != .line then {start_line, start_side: "RIGHT"} else {} end)]')
+            fi
+            me=$(gh api user --jq .login)
+            existing=$(gh api --paginate "$reviews" \
+              --jq ".[] | select(.user.login == \"$me\" and (.body | startswith(\"$marker\"))) | .id" | head -1)
+            if [ -n "$existing" ]; then
+              jq -n --arg body "$body" '{body: $body}' | gh api -X PUT "$reviews/$existing" --input - >/dev/null
+              [ "$comments" = '[]' ] && return
+              body="New issue(s) on \`${HEAD_SHA:0:7}\`; the summary above is kept up to date."
+            fi
+            if ! jq -n --arg body "$body" --arg sha "$HEAD_SHA" --argjson comments "$comments" \
+                '{commit_id: $sha, event: "COMMENT", body: $body, comments: $comments}' \
+                | gh api -X POST "$reviews" --input - >/dev/null 2>&1; then
+              # A comment GitHub cannot anchor on the diff rejects the whole
+              # review: post it again with the comments listed in the body.
+              extra=$(printf '%s' "$comments" | jq -r '.[] | "- `\(.path):\(.line)`: \(.body | gsub("\n"; " "))"')
+              jq -n --arg body "$body"$'\n\n**Comments:**\n'"$extra" --arg sha "$HEAD_SHA" \
+                '{commit_id: $sha, event: "COMMENT", body: $body}' | gh api -X POST "$reviews" --input - >/dev/null
+            fi
+          }
+
+          if [ "$status" != pass ] || [ ${#findings[@]} -gt 0 ]; then
+            {
+              echo "### ❌ PSAE pre-review: ${#findings[@]} issue(s) to fix"
+              echo
+              printf -- '- %s\n' "${findings[@]:-The review failed; see the run log.}"
+              echo
+              echo "$summary"
+              echo
+              echo "_Reviewed \`${HEAD_SHA:0:7}\`. Push a fix and the pull request is reviewed again._"
+            } | post_review yes
+            printf '::error::%s\n' "${findings[@]}" "Pre-review failed: fix the findings and push again."
+            exit 1
+          fi
+
+          # Passed: request the PSAE review team(s) — psae-js-reviewer for
+          # JavaScript changes, psae-reviewer for anything else, both for a mix.
+          owner=${GITHUB_REPOSITORY%%/*}
+          files=$(gh pr view "$PR_URL" --json files --jq '.files[].path')
+          teams=()
+          if printf '%s\n' "$files" | grep -qE '\.(m|c)?js$'; then teams+=(psae-js-reviewer); fi
+          if [ -z "$files" ] || printf '%s\n' "$files" | grep -qvE '\.(m|c)?js$'; then teams+=(psae-reviewer); fi
+          jq -n '{team_reviewers: $ARGS.positional}' --args "${teams[@]}" \
+            | gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/${PR_URL##*/}/requested_reviewers" --input - >/dev/null
+          requested=$(gh api "repos/$GITHUB_REPOSITORY/pulls/${PR_URL##*/}/requested_reviewers" --jq '[.teams[].slug] | join(", ")')
+          for team in "${teams[@]}"; do
+            if [[ ", $requested, " != *", $team, "* ]]; then
+              echo "::error::Could not request $owner/$team (requested now: ${requested:-none})."
+              exit 1
+            fi
+          done
+          echo "Requested review from: $requested"
+          {
+            echo "### ✅ PSAE pre-review passed"
+            echo
+            echo "$summary"
+            echo
+            echo "Review requested from: $(printf "$owner/%s " "${teams[@]}")"
+          } | post_review no
